@@ -1,10 +1,10 @@
 import argparse
 import math
+import pickle
 import itertools
 from time import time
 import pandas as pd
 import numpy as np
-from scipy.optimize import linprog
 from pulp import *
 
 class Model:
@@ -101,7 +101,7 @@ class Model:
         # method 2
         prev_min = 0 - self.prev_volume
         prev_max = self.max_capacity - self.prev_volume
-        n = self.args.n # break the problem into 2-hourly chunks
+        n = self.args.n 
         for i in range(0, len(self.half_hourly_idx), n):
             self.prev_volume = lpSum(self.list_net_charge[i:i+n])
             self.model += self.prev_volume >= prev_min
@@ -136,6 +136,8 @@ class Model:
         self.post_df_half_hourly['half_hourly_sell'] = [self.half_hourly_sell[k].value() for k in self.half_hourly_idx]
         self.post_df_daily['daily_buy'] = [self.daily_buy[k].value() for k in self.daily_idx]
         self.post_df_daily['daily_sell'] = [self.daily_sell[k].value() for k in self.daily_idx]
+        self.post_df_daily['daily_buy_price'] = self.daily_buy_price
+        self.post_df_daily['daily_sell_price'] = self.daily_sell_price
         self.post_df = pd.merge(self.post_df_half_hourly, self.post_df_daily, how='left', left_index=True, right_index=True)
         self.post_df.ffill(inplace=True)
         #self.post_df /= 2 # half because the buys / sells are in MWh for half hour slots
@@ -146,10 +148,24 @@ class Model:
         self.post_df = pd.merge(self.post_df, self.half_hourly_data, left_index=True, right_index=True)
         self.post_df['half_hourly_buy_price'] = self.half_hourly_buy_price
         self.post_df['half_hourly_sell_price'] = self.half_hourly_sell_price
-        self.post_df = pd.merge(self.post_df, self.daily_data, left_index=True, right_index=True, how='left')
+        self.post_df[['half_hourly_buy', 'half_hourly_sell', 'daily_buy', 'daily_sell',
+       'net_charge', 'rolling_charge', 
+       'half_hourly_buy_price', 'half_hourly_sell_price', 'daily_buy_price', 'daily_sell_price', 
+       'Market 1 Price [£/MWh]', 'Market 2 Price [£/MWh]', 'Market 3 Price [£/MWh]', 
+       'Transmission System Electricity Demand [MW]', 'Wind Generation [MW]',
+       'Solar Generation [MW]', 'Coal Generation [MW]', 'Gas Generation [MW]'
+       ]]
         self.post_df.ffill(inplace=True)
+        self.post_df['P/L'] = -self.post_df['half_hourly_sell'] * self.post_df['half_hourly_sell_price'] - \
+                                self.post_df['half_hourly_buy'] * self.post_df['half_hourly_buy_price'] - \
+                                    self.post_df['daily_sell'] * self.post_df['daily_sell_price'] - \
+                                        self.post_df['daily_buy'] * self.post_df['daily_buy_price']
+        self.post_df['P/L'] /= 2 # since each slot is half hourly
+        self.post_df['P/L'] *= (1 - self.params['Storage volume degradation rate'] * self.params['Lifetime (2)'] / 2)
+        self.yearly_pnl = self.post_df['P/L'].resample('Y').sum()
+        self.yearly_pnl -= self.params['Fixed Operational Costs']
         self.post_df.to_csv(self.args.output_csv)
-        print(self.post_df['rolling_charge'].max(), self.post_df['rolling_charge'].min())
+        self.yearly_pnl.to_csv(self.args.pnl_csv)
         check_csv = self.post_df.resample('D').agg('last')
         check_csv.to_csv('check.csv')
 
@@ -185,14 +201,18 @@ if __name__ == '__main__':
     parser.add_argument('-params_fp', type=str, default='constraints.xlsx', help='Please input filepath to the constraints / parameters')
     #parser.add_argument('-output_fp', type=str, default='output.txt', help='Please output filepath')
     parser.add_argument('-output_csv', type=str, default='output.csv', help='Please output csv filepath')
+    parser.add_argument('-pnl_csv', type=str, default='pnl.csv', help='Please output filepath for pnl file.')
+    parser.add_argument('-pickle_fp', type=str, default='model_dump.pkl', help='Please model pickle output filepath')
     parser.add_argument('-init_volume', type=float, default=0, help='Please input the initial volume of the battery in MW')
     parser.add_argument('-init_cycles', type=float, default=0, help='Please input the initial # cycles of the battery')
     parser.add_argument('-start_datetime', type=str, default='2018-01-01 00:00:00', help='Please input the start datetime for the problem')
     parser.add_argument('-end_datetime', type=str, default='2020-12-31 23:59:59', help='Please input the end datetime for the problem')
-    parser.add_argument('-n', type=int, default= 2 * 24 * 15, help='Please input the time interval to check that battery charge is between 0 and max capacity, in # half hourly slots')
-    #parser.add_argument('-end_datetime', type=str, default='2018-12-31 23:59:59', help='Please input the end datetime for the problem')
+    parser.add_argument('-n', type=int, default= 2 * 24, help='Please input the time interval to check that battery charge is between 0 and max capacity, in # half hourly slots')
+    #parser.add_argument('-end_datetime', type=str, default='2018-01-31 23:59:59', help='Please input the end datetime for the problem')
     args = parser.parse_args()
     t0 = time()
     model = Model(args)
     model.build_model()
     print(f'Time taken: {time()-t0}s')
+    with open(args.pickle_fp, 'wb') as f:
+        pickle.dump(model.__dict__, f)
